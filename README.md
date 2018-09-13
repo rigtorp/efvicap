@@ -1,5 +1,7 @@
 # efvicap
 
+[![GitHub](https://img.shields.io/github/license/rigtorp/efvicap.svg)](https://github.com/rigtorp/efvicap/blob/master/LICENSE)
+
 *efvicap* is a packet capture tool for network adapters
 from [Solarflare](http://solarflare.com/). It uses the ef_vi API for
 direct access to DMA memory and can capture traffic intended for
