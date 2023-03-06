@@ -95,21 +95,31 @@ extern "C" void signalHandler(int /*signal*/) { active = false; }
 
 int main(int argc, char *argv[]) {
   static const char usage[] =
-      " [-i iface] [-w file] maddr\n"
+      " [-i iface] [-w file] [-t] [-o] maddr\n"
       "\n"
       "  -i iface    Interface to capture packets from\n"
-      "  -w file     Write packets in pcap format to file";
+      "  -w file     Write packets in pcap format to file\n"
+      "  -t          Use hardware timestamps if available (or fail)\n"
+      "  -o          Capture outgoing packets if available (or fail)";
 
   std::string interface;
   std::string filename;
+  bool hw_timestamps = false;
+  bool sniff_transmit = false;
   int c = 0;
-  while ((c = getopt(argc, argv, "i:w:")) != -1) {
+  while ((c = getopt(argc, argv, "i:w:to")) != -1) {
     switch (c) {
     case 'i':
       interface = optarg;
       break;
     case 'w':
       filename = optarg;
+      break;
+    case 't':
+      hw_timestamps = true;
+      break;
+    case 'o':
+      sniff_transmit = true;
       break;
     default:
       std::cerr << "usage: " << argv[0] << usage << std::endl;
@@ -160,9 +170,12 @@ int main(int argc, char *argv[]) {
     throw std::system_error(errno, std::generic_category(),
                             "ef_pd_alloc_by_name");
   }
-  enum ef_vi_flags vi_flags = EF_VI_FLAGS_DEFAULT;
+  unsigned vi_flags = EF_VI_FLAGS_DEFAULT;
+  if (hw_timestamps) {
+    vi_flags |= EF_VI_RX_TIMESTAMPS;
+  }
   if (ef_vi_alloc_from_pd(&res.vi, res.dh, &res.pd, res.dh, -1, -1, 0, NULL, -1,
-                          vi_flags) < 0) {
+                          (enum ef_vi_flags) vi_flags) < 0) {
     throw std::system_error(errno, std::generic_category(),
                             "ef_vi_alloc_from_pd");
   }
@@ -243,12 +256,30 @@ int main(int argc, char *argv[]) {
                               "ef_vi_filter_add");
     }
   }
+  if (sniff_transmit) {
+    ef_filter_spec filter_spec;
+    ef_filter_spec_init(&filter_spec, EF_FILTER_FLAG_NONE);
+    if (ef_filter_spec_set_tx_port_sniff(&filter_spec)) {
+      throw std::system_error(errno, std::generic_category(),
+                              "ef_filter_spec_set_tx_port_sniff");
+    }
+    if (ef_vi_filter_add(&res.vi, res.dh, &filter_spec, NULL) < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "ef_filter_spec_set_tx_port_sniff/ef_vi_filter_add");
+    }
+  }
 
   // Open pcap output
   pcap_t *pcap = nullptr;
   pcap_dumper_t *pcapDumper = nullptr;
   if (!filename.empty()) {
-    pcap = pcap_open_dead(DLT_EN10MB, 65535);
+    int link_type = DLT_EN10MB;
+    int snap_len = 65535;
+    u_int precision = PCAP_TSTAMP_PRECISION_MICRO;
+    if (hw_timestamps) {
+      precision = PCAP_TSTAMP_PRECISION_NANO;
+    }
+    pcap = pcap_open_dead_with_tstamp_precision(link_type, snap_len, precision);
     pcapDumper = pcap_dump_open(pcap, filename.c_str());
     if (!pcapDumper) {
       throw std::runtime_error("pcap_dump_open: " +
@@ -276,7 +307,18 @@ int main(int argc, char *argv[]) {
             pcap_pkthdr pktHdr = {};
             pktHdr.caplen = bufLen;
             pktHdr.len = bufLen;
-            gettimeofday(&pktHdr.ts, nullptr);
+	    if (hw_timestamps) {
+	      timespec ts;
+	      unsigned flags;
+	      const void *pkt = (const char *) res.pktBufs + pktBufSize * EF_EVENT_RX_RQ_ID(evs[i]);
+	      if (ef_vi_receive_get_timestamp_with_sync_flags(&res.vi, pkt, &ts, &flags)) {
+                throw std::runtime_error("failed to get hw timestamp");
+	      }
+	      pktHdr.ts.tv_sec = ts.tv_sec;
+	      pktHdr.ts.tv_usec = ts.tv_nsec; // magic number should be set for nanos
+	    } else {
+              gettimeofday(&pktHdr.ts, nullptr);
+	    }
             pcap_dump(reinterpret_cast<u_char *>(pcapDumper), &pktHdr,
                       reinterpret_cast<const u_char *>(buf));
           } else {
